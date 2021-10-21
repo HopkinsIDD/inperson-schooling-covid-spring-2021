@@ -1,0 +1,1771 @@
+---
+output: html_document
+---
+
+
+## Source Code for _In-person schooling and associated COVID-19 risk in the United States over Spring Semester 2021_ 
+#### Kirsten E. Wiens, Claire P. Smith, Elena Badillo-Goicoechea, Kyra H. Grantz, M. Kate Grabowski, Andrew S. Azman, Elizabeth A. Stuart, Justin Lessler
+ _________
+ 
+Code is provided to reproduce the primary in-person schooling (`1-Main-Schooling-Analysis.Rmd`) and occupation/work outside home (`2-Educators-Analysis.Rmd`) analyses using a synthetic dataset. Hence, results produced when knitting these documents will **not** match those presented in the accompanying paper. 
+
+Data to reproduce paper figures/tables are freely available from the CMU Delphi Research Group to researchers at universities and non-profits as detailed at Getting Data Access - Delphi Epidata API (cmu-delphi.github.io).
+
+Please reach out to justin[at]jhu.edu if you have any questions.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, message = FALSE, warning = FALSE, error=TRUE)
+```
+
+```{r load-pkgs}
+  ##Source code and library stuff
+  library(tidyverse)
+  library(anytime)
+  library(survey)
+  library(srvyr)
+  library(maps)
+  library(R.utils)
+  library(data.table)
+  library(extrafont)
+  library(viridis)
+  library(gtsummary)
+  library(janitor)
+  library(pheatmap)
+  library(RColorBrewer)
+  library(RcppRoll)
+  library(gganimate)
+  library(transformr)
+  library(ggcorrplot)
+  library(corrplot)
+  library(cdlTools)
+  library(magick)
+
+  source("HelperFuncs.R")
+  source("MainTextFigures.R")
+```
+
+```{r warning-message}
+
+  knitr::knit_exit("**WARNING: This document will prepare tables and figures exploring the effects of in-person schooling using a synthetic dataset. Hence, results produced when knitting this document will not match those presented in the accompanying paper. Data to reproduce paper figures/tables are freely available from the CMU Delphi Research Group to researchers at universities and non-profits as detailed at Getting Data Access - Delphi Epidata API (cmu-delphi.github.io). To proceed with running this document with the synthetic dataset, please comment out or delete this line (ln 49 in the RMD).**")
+
+```
+
+```{r load-full-data, cache=TRUE}
+# load full dataset
+df_ws <- readRDS("data/DATA_FOR_TESTING_ONLY_DOES_NOT_REPRODUCE_RESULTS_df_full_spring2021.rds")
+# recode, without dropping HH with only 1 individual
+df_ws <- standard_recode(df_ws, min_HH=1) %>%
+   # remove small number of observations missing zipcode and state
+   filter(!is.na(State)) %>%
+   # just keep most necessary columns to save on memory
+   select(Date, period, wk, month, State, weight, fips, any_vaccine,
+          tst_pos, cli_pos, cli2_pos) %>%
+   # removing missing vaccine info
+   filter(!is.na(any_vaccine))
+```
+
+```{r load-k12-data, cache=TRUE}
+# load data for those living with school-aged children
+df <- readRDS( "data/DATA_FOR_TESTING_ONLY_DOES_NOT_REPRODUCE_RESULTS_df_k12_spring2021.rds")
+df <- standard_recode(df) %>%
+  # remove small number of observations missing zipcode and state
+  filter(!is.na(State)) %>%
+  # observations missing answers to both of the in-person schooling questions
+  filter(!is.na(Child_IP_full_bin),
+         !is.na(Child_IP_part_bin))
+
+# store date range 
+date_range <- range(as.Date(df$Date))
+```
+
+```{r merge-county-data}
+# add county-level data
+cnty_dat<- read_csv("data/county_factors.csv")%>%
+  mutate(fips=str_pad(FIPS,width=5,pad="0"))%>%
+  select(-FIPS, -X1)
+
+df <- left_join(df, cnty_dat)
+```
+
+```{r merge_case_data}
+# add biweekly attack rates
+csse <- read_csv("data/JHUCSSE.csv")
+df <- merge_csse(df,csse)%>%
+  # add month
+  mutate(month = lubridate::month(Date,label=TRUE))
+rm(csse)
+```
+
+```{r load-vax-data}
+# load CDC vaccination data
+vx <- read_csv('data/cdc_county_vaccines.csv') %>%
+  filter(Date >= date_range[1] & Date <= date_range[2])
+
+# add county populations
+cty_pops <- cnty_dat %>% select(fips, Population) %>% unique()
+vx <- merge(vx, cty_pops, by.x = 'FIPS', by.y = 'fips')
+
+rm(cnty_dat, cty_pops)
+```
+
+```{r load-strains, message=FALSE}
+vt <- read_csv('data/variant_state_level.csv') %>%
+  dplyr::rename("Alpha" = "B.1.1.7", "Delta" = "B.1.617.2") %>%
+  dplyr::select(Alpha, Delta, location, date) %>%
+  mutate(variant = Alpha + Delta)
+# read in state fips code mapping
+loc <- read.csv("data/state_fips.csv") %>%
+  rename(fips = location, location = abbreviation) %>%
+  dplyr::select(location, fips)
+vt <- left_join(vt, loc)
+```
+
+```{r process-strains, message=FALSE}
+# Lag for assigning smoothed fits to survey responses
+lag_days <- 7 
+vt <- vt %>%
+  filter(date <= "2021-06-30", date >= "2020-12-01")
+FIPS <- unique(vt$fips)
+pred.dates <- seq(from = as.Date(date_range[1] - lag_days), to = date_range[2], by = "day")
+vt_fits <- data.frame(date = as.Date(character()),
+                      survey_date = as.Date(character()),
+                      fit = numeric(),
+                      fips = character())
+# Fit a smooth spline to the variant proportions for each state
+for(i in FIPS) {
+  temp <- filter(vt, fips == i)
+  
+  fit <- smooth.spline(y = temp$variant, x = temp$date, df = 6)
+  preds <- predict(fit, x = as.numeric(pred.dates))$y
+  preds <- replace(preds, preds < 0, 0)
+  preds <- replace(preds, preds > 1, 1)
+  vt_fits <- bind_rows(vt_fits, data.frame(date = pred.dates,
+                                           survey_date = as.Date(pred.dates + lag_days),
+                                           fit = preds,
+                                           fips = i))
+}
+vt_fits <- left_join(vt_fits, loc)
+
+#merge variant data into main data frame
+df <- merge(df,
+            vt %>% rename(State = location, Date = date) %>%
+              dplyr::select(-fips))
+
+# merge variant fits into main data frame, adjusting for lag
+vt_merge <- vt_fits %>%
+  dplyr::select(survey_date, fit, location) %>%
+  rename(Date = survey_date, State = location, variant_fit = fit)
+df <- merge(df, vt_merge)
+rm(vt_merge)
+```
+
+```{r national-weekly-weighted-aggregate}
+# national-level weekly aggregates
+df_us <- aggregate_national(df)
+```
+
+```{r text-ip}
+# total number of respondents and percent in person
+ntot <- nrow(df)
+pip <- aggregate_national(df, 'Child_IP_any', aggregate_by=NULL)
+pip <- signif(pip$mean*100, 3)
+
+# percent in person
+pip1 <- df_us%>%filter(wk==2, variable=='Child_IP_any')
+pip1 <- pip1$mean*100
+
+pip2 <- df_us%>%filter(wk==23, variable=='Child_IP_any')
+pip2 <- pip2$mean*100
+
+message('We synthesized data from ', ntot, 
+' respondents in 50 US states and Washington, DC over the study period. 
+Of these ', pip, '% reported having at least one child 
+in their household attending in-person schooling.
+
+The proportion reporting in-person schooling increased from ', signif(pip1, 3), 
+'% in the first week to ', signif(pip2, 3), '% in the final week of the study period.')
+```
+
+```{r text-ft}
+# percent full time
+pft <- aggregate_national(df%>%filter(Child_IP_any=='Yes'), 'Child_IP_full_bin', aggregate_by=NULL)
+pft <- signif(pft$mean*100, 3)
+
+pft_wk <- aggregate_national(df%>%filter(Child_IP_any=='Yes'), 'Child_IP_full_bin')
+
+pft1 <- pft_wk%>%filter(wk==2, variable=='Child_IP_full_bin')
+pft1 <- pft1$mean*100
+
+pft2 <- pft_wk%>%filter(wk==23, variable=='Child_IP_full_bin')
+pft2 <- pft2$mean*100
+
+# proportion with X interventions
+nip <- nrow(df%>%filter(Child_IP_any=='Yes'))
+p1mit <- signif(sum(df$n_interventions > 0, na.rm = T)/nip*100, 3)
+p4mit <- signif(sum(df$n_interventions >= 4, na.rm = T)/nip*100, 3)
+p7mit <- signif(sum(df$n_interventions >= 7, na.rm = T)/nip*100, 3)
+
+# average number of mitigation measures
+nmit1 <- df_us%>%filter(wk==2, variable=='n_interventions')
+nmit1 <- signif(nmit1$mean, 3)
+
+nmit2 <- df_us%>%filter(wk==23, variable=='n_interventions')
+nmit2 <- signif(nmit2$mean, 3)
+
+message(pft, '% reported full time in-person instruction overall, 
+and this proportion increased from ', signif(pft1, 3), '% to ', signif(pft2, 3), '%. 
+
+Average number of mitigation measures changed from ', nmit1, ' to ', nmit2, '.
+
+In addition, ', p1mit, '% with in-person schooling reported at least one intervention in place, ',
+p4mit, '% reported at least four interventions, and ', p7mit, '% reported at least seven.')
+```
+
+## Table S1
+
+Sociodemographic characteristics of participants with ≥1 school-aged child in the household, comparing those reporting no in-person schooling to those reporting any part-time and full-time in-person schooling. Observed and survey-weighted percentages reported.
+
+```{r tableS1}
+## Summarize data for those attending full-time in-person school; first subset relevant data, then make a temporary tables for unweighted and weighted percents 
+  tmp_df_ip_full <-df%>%filter(Child_IP_full=="Yes") %>% 
+              select( Gender, Age, Pre_K, Grades1_5, Grades6_8, Grades9_12, Educational_Level, OccupationRed, Description, HH_sz)
+  
+  table1_ipfull <- tbl_summary(tmp_df_ip_full, missing="always")
+  
+  
+  tmp_df_ip_full_weighted <-df%>%filter(Child_IP_full=="Yes") %>% 
+              select( State, weight, Gender, Age, Pre_K, Grades1_5, Grades6_8, Grades9_12, Educational_Level, OccupationRed, Description, HH_sz)
+  
+  
+  table1_ipfull_weighted<- survey::svydesign(~1, data=tmp_df_ip_full_weighted, weights=~weight, strata=~State) %>%  tbl_svysummary(include=c(Gender, Age, Pre_K, Grades1_5, Grades6_8, Grades9_12, Educational_Level, OccupationRed, Description, HH_sz), percent = "col", statistic=list(all_categorical()~"{p}%"))
+  
+
+## Summarize data for those attending part-time in-person school; first subset relevant data, then make a temporary tables for unweighted and weighted percents 
+  tmp_df_ip_part <-df%>%filter(Child_IP_part=="Yes") %>% 
+               select( Gender, Age, Pre_K, Grades1_5, Grades6_8, Grades9_12, Educational_Level, OccupationRed, Description, HH_sz)
+    
+  table1_ippart <- tbl_summary(tmp_df_ip_part, missing="always")
+  
+  
+    
+  tmp_df_ip_part_weighted <-df%>%filter(Child_IP_part=="Yes") %>% 
+              select( State, weight, Gender, Age, Pre_K, Grades1_5, Grades6_8, Grades9_12, Educational_Level, OccupationRed, Description, HH_sz)
+  
+  
+  table1_ippart_weighted<- survey::svydesign(~1, data=tmp_df_ip_part_weighted, weights=~weight, strata=~State) %>%  tbl_svysummary(include=c(Gender, Age, Pre_K, Grades1_5, Grades6_8, Grades9_12, Educational_Level, OccupationRed, Description, HH_sz), percent = "col", statistic=list(all_categorical()~"{p}%"))
+  
+  
+## Summarize data for those not attending any in-person school; first subset relevant data, then make a temporary tables for unweighted and weighted percents 
+  tmp_df_ip_no <-df%>%filter(Child_IP_any=="No") %>% 
+                  select( Gender, Age, Pre_K, Grades1_5, Grades6_8, Grades9_12, Educational_Level, OccupationRed, Description, HH_sz)
+  table1_ip_no <- tbl_summary(tmp_df_ip_no, missing="always")
+  
+  
+    
+  tmp_df_ip_no_weighted <-df%>%filter(Child_IP_any=="No") %>% 
+              select( State, weight, Gender, Age, Pre_K, Grades1_5, Grades6_8, Grades9_12, Educational_Level, OccupationRed, Description, HH_sz)
+  
+  
+  table1_ip_no_weighted<- survey::svydesign(~1, data=tmp_df_ip_no_weighted, weights=~weight, strata=~State) %>%  tbl_svysummary(include=c(Gender, Age, Pre_K, Grades1_5, Grades6_8, Grades9_12, Educational_Level, OccupationRed, Description, HH_sz), percent = "col", statistic=list(all_categorical()~"{p}%"))
+  
+
+## Extract relevant table data from table summaries generated above  
+ 
+  ### Full time 
+  full_nw<-as.data.frame(table1_ipfull$table_body[,c("label", "stat_0")])
+  full_nw<-full_nw[-which(full_nw$label=="Unknown" | full_nw$label=="(Missing)"),]
+
+  full_w<-as.data.frame(table1_ipfull_weighted$table_body[,c("label", "stat_0")])
+  full_w<-full_w[-which(full_w$label=="Unknown" | full_w$label=="(Missing)"),]
+
+  ### Part time 
+  part_nw<-as.data.frame(table1_ippart$table_body[,c("label", "stat_0")])
+  part_nw<-part_nw[-which(part_nw$label=="Unknown" | part_nw$label=="(Missing)"),]
+
+  part_w<-as.data.frame(table1_ippart_weighted$table_body[,c("label", "stat_0")])
+  part_w<-part_w[-which(part_w$label=="Unknown" | part_w$label=="(Missing)"),]
+
+  # No in person schooling 
+  no_nw<-as.data.frame(table1_ip_no$table_body[,c("label", "stat_0")])
+  no_nw<-no_nw[-which(no_nw$label=="Unknown" | no_nw$label=="(Missing)"),]
+
+  no_w<-as.data.frame(table1_ip_no_weighted$table_body[,c("label", "stat_0")])
+  no_w<-no_w[-which(no_w$label=="Unknown" | no_w$label=="(Missing)"),]
+
+
+## combine data and write table 
+  fb_supp_table1<-cbind(no_nw, no_w[,2], part_nw[,2], part_w[,2], full_nw[,2], full_w[,2])
+  colnames(fb_supp_table1)<-c("Variable","Unweighted_noip", "Weighted_noip", "Unweighted_part", "Weighted_part", "Unweighted_full", "Weighted_full")
+  
+  fb_supp_table1 <- fb_supp_table1[-which(fb_supp_table1$Variable=="No"),]
+  write.csv(fb_supp_table1, file="tables/tableS1.csv")
+
+```
+
+## Table S2
+
+Monthly COVID-19-related outcomes in different subsets of US CTIS respondents, including total number, observed percent, and percent weighted to account for survey design.
+
+```{r}
+# aggregate 3 cli outcomes
+outcomes <- c('tst_pos', 'cli_pos', 'cli2_pos')
+
+# 1) by month + overall: all respondents
+tmp1 <- aggregate_national(df_ws, outcomes, 
+                           aggregate_by = 'month',
+                           return_unweighted = TRUE)
+
+# 2) by month + overall: school-aged children
+tmp2 <- aggregate_national(df, outcomes, 
+                           aggregate_by = 'month',
+                           return_unweighted = TRUE)
+
+# 3) by month + in-person schooling status
+tmp3 <- aggregate_national(df, outcomes, 
+                           aggregate_by = c('month', 'Child_IP_type'),
+                           return_unweighted = TRUE)
+
+# combine
+tableS2 <- rbind(tmp1%>%mutate(group='All respondents'),
+                 tmp2%>%mutate(group='All with school age children'),
+                 tmp3%>%mutate(group=Child_IP_type)%>%select(-Child_IP_type),
+                 use.names=TRUE) %>%
+  drop_na() %>%
+  mutate(pct_unweighted = round(pct_unweighted*100,2),
+         mean = paste0(round(mean*100,2), '%'),
+         N = paste0(format(N, big.mark = ',', scientific = FALSE), 
+                    ' (', pct_unweighted, '%)')) %>%
+  # dcast multiple vars only available in data table
+  data.table() %>%
+  data.table::dcast(group + month ~ variable, 
+                    value.var = list('N', 'mean'))
+
+# order columns
+setcolorder(tableS2, c(1, 2,
+                       grep('cli_', names(tableS2)),
+                       grep('cli2', names(tableS2)),
+                       grep('tst', names(tableS2))))
+
+# save
+write.csv(tableS2, 'tables/tableS2.csv')
+```
+
+## Figure 1
+
+Changes over time in in-person schooling by county. Distribution of survey responses from Jan. 12 to Mar. 31 (left column), Apr. 1 to Jun. 12 (center column) and change over time (right column). Results are shown for (A) number of survey respondents reporting ≧1 school-aged child in the household, (B) percent reporting in-person schooling, (C) percent of respondents with in-person schooling reporting full-time in-person instruction, and (D) average number of school-based mitigation measures. “Relative Amount” in the right column indicates values in Apr. 1 to Jun. 12 (center column) divided by values in Jan. 12 to Mar. 31 (left column). Grey indicates county/periods where fewer than 10 respondents reported in-person schooling.
+
+```{r fig1, fig.width=8, fig.height=8}
+
+# make map
+map1 <- fig_1(df%>%mutate(period=ifelse(Date<="2021-04-01","jan_mar","apr_jun")))
+
+map1
+```
+
+## Figure 2
+
+Concurrent changes in in-person schooling, vaccination, and variant prevalence. Changes over time between Jan. 12 and Jun. 12 in (A) percent of respondents living with school-aged children reporting any in-person schooling, (B) average number of school-based mitigation measures, (C) smoothed percent of GISAID SARS-CoV-2 sequenced isolates that were Alpha or Delta, and (D) percent of respondents living with school-aged children reporting having received at least one COVID-19 vaccine dose. Upper panel line plots show national averages by week weighted using US CTIS survey weights (A-B), state population (C), and county population (D). Lower panel histograms show the number of county-months with the indicated percentages (A,C,D) or numbers (B). Note that the number of respondents decreased over time (Fig 1d), which may contribute to the increasing number of zero values in the histograms in June.
+
+```{r fig2, fig.width=8, fig.height=7}
+# aggregate variables to plot to the national level by week
+df_us2 <- aggregate_national(df, variables = c('Child_IP_any', 'n_interventions',
+                                               'variant_fit', 'any_vaccine',
+                                               'Alpha', 'Delta'))
+
+# assign the final date in each epi week as the Date
+epiwk_dates <- df %>% 
+  select(Date, wk) %>% 
+  unique() %>%
+  setorderv(c('wk', 'Date')) %>%
+  mutate(rem=duplicated(wk, fromLast = TRUE)) %>%
+  filter(rem==FALSE) %>%
+  select(wk, Date)
+
+df_us2 <- left_join(epiwk_dates, df_us2)
+
+# convert proportions to percent
+df_us2 <- df_us2 %>%
+  mutate(mean = ifelse(variable=='n_interventions', mean, mean*100))
+
+# aggregate by county and month
+df_cnty <- df %>%
+  # for each week and county
+  group_by(month, fips) %>%
+  # get mean number of interventions, number vaccinated, and number in-person schooling
+  summarize(n = n(),
+            avg_mit = mean(n_interventions, na.rm = T),
+            n_vax = sum(had_vaccine=='Yes', na.rm = T),
+            n_unvax = sum(had_vaccine=='No', na.rm = T),
+            n_ip = sum(Child_IP_part_bin==TRUE | Child_IP_full_bin==TRUE),
+            avg_vt = mean(variant_fit, na.rm = T),
+            avg_Alpha = mean(Alpha, na.rm = T),
+            avg_Delta = mean(Delta, na.rm = T)) %>%
+  ungroup() %>%
+  # get proportions
+  mutate(pct_vax = n_vax/(n_vax+n_unvax)*100,
+         pct_ip = n_ip/n*100,
+         avg_vt = avg_vt*100,
+         avg_Alpha = avg_Alpha*100,
+         avg_Delta = avg_Delta*100) %>%
+  # reshape long
+  reshape2::melt(id.vars=c('month', 'fips'),
+                 measure.vars=c('pct_ip', 'avg_mit', 'avg_vt', 
+                                'avg_Alpha', 'avg_Delta', 'pct_vax'))
+
+# plotting variables
+cols <- brewer.pal(5, 'BuPu')[2:5]
+cnty_vars <- c('pct_ip', 'avg_mit', 'avg_vt', 'pct_vax')
+natl_vars <- c('Child_IP_any', 'n_interventions', 'variant_fit', 'any_vaccine')
+labs <- c('In-person (%)', 'Avg. # mitigations', 
+          'Alpha+Delta (%)', 'Vaccinated (%)')
+
+# line plots
+line_plts <- list()
+for (i in 1:4) {
+  line_plts[[i]] <- make_natl_plot(df_us2, natl_vars[[i]], labs[[i]], cols[[i]])
+}
+
+# histograms
+hists <- list()
+for (i in 1:4) {
+  hists[[i]] <- make_cnty_plot(df_cnty, cnty_vars[[i]], labs[[i]], cols[[i]])
+}
+
+# properly ordered list
+plt_list <- list(line_plts[[1]], line_plts[[2]],
+                 hists[[1]], hists[[2]],
+                 line_plts[[3]], line_plts[[4]],
+                 hists[[3]], hists[[4]])
+
+cowplot::plot_grid(plotlist = plt_list, ncol=2,
+                   labels = c('A', 'B', 
+                              '', '', 
+                              'C', 'D', 
+                              '', ''),
+                   rel_heights = c(0.75, 1, 0.75, 1)) -> f2
+
+f2
+```
+
+## Movie S1
+
+Changes in in-person schooling, vaccination, and variant prevalence. Top left: County-level smoothed weekly estimates of percent of individuals living with school-aged children participating in part-time or full-time in-person schooling. Top right: County-level smoothed weekly estimates of the percent of individuals living with school-aged children that had received any number of COVID-19 vaccine doses. Bottom left: State-level smoothed weekly estimates of the proportion of circulating SARS-CoV-2 strains that were the Alpha variant. Bottom right: State-level smoothed weekly estimates of the proportion of circulating SARS-CoV-2 strains that were the Delta variant. In-person schooling and vaccination estimated using United States COVID-19 Trends and Impact Survey data; counties with fewer than 20 respondents reporting in-person schooling excluded. Variant prevalence estimated using GISAID sequencing data. Dates represent the last day of each week.
+
+```{r movieS1}
+# whether or not to re-animate
+reanimate <- FALSE
+
+if (reanimate) {
+  
+  ## prep variant proportions for map animations by state -------------------
+  # set date range
+  st_vt <- vt %>%
+    filter(date >= date_range[1], date <= date_range[2]) %>%
+    mutate(day = as.numeric(date) - min(as.numeric(date)) + 1)
+  
+  # create table of smoothed daily variant proportions
+  st_vt_smooth <- data.frame(matrix(ncol = 4, nrow = 0))
+  names(st_vt_smooth) <- c('fips', 'day', 'var', 'val')
+  
+  for (i in unique(st_vt$fips)) {
+    # subset to state
+    tmp <- st_vt %>% filter(fips == i)
+      
+    # get smoothed estimates
+      fit.alpha <- smooth.spline(x = tmp$day, y = tmp$Alpha)
+      preds.alpha <- predict(fit.alpha, 1:164)
+      preds.alpha <- preds.alpha$y
+      preds.alpha[which(preds.alpha>1)] <- 1
+      preds.alpha[which(preds.alpha<0)] <- 0
+      st_vt_smooth <- rbind(st_vt_smooth,
+                              data.frame(fips = i,
+                                         day = 1:164,
+                                         var = "alpha",
+                                         val = preds.alpha))
+      
+      fit.delta <- smooth.spline(x = tmp$day, y = tmp$Delta)
+      preds.delta <- predict(fit.delta, 1:164)
+      preds.delta <- preds.delta$y
+      preds.delta[which(preds.delta>1)] <- 1
+      preds.delta[which(preds.delta<0)] <- 0
+      st_vt_smooth <- rbind(st_vt_smooth,
+                              data.frame(fips = i,
+                                         day = 1:164,
+                                         var = "delta",
+                                         val = preds.delta))
+      
+      fit.combo <- smooth.spline(x = tmp$day, y = tmp$variant)
+      preds.combo <- predict(fit.combo, 1:164)
+      preds.combo <- preds.combo$y
+      preds.combo[which(preds.combo>1)] <- 1
+      preds.combo[which(preds.combo<0)] <- 0
+      st_vt_smooth <- rbind(st_vt_smooth,
+                              data.frame(fips = i,
+                                         day = 1:164,
+                                         var = "Combined",
+                                         val = preds.combo))
+    }
+    
+  # Select end of week values
+  st_vt_smooth <- st_vt_smooth %>%
+    mutate(wk = ceiling(day/7)) %>%
+    group_by(wk, fips, var) %>%
+    summarize(val = max(val))
+  
+  # set week to last date of month
+  st_vt_smooth <- left_join(epiwk_dates, st_vt_smooth) %>%
+    mutate(Date = format(Date, format = c('%b-%d')))
+  
+  ## prep vaccination and in-person data for map animations by county -------------
+  # identify counties to exclude based on fewer than 20 with in-person schooling
+  exclude <- df %>%
+    group_by(fips) %>%
+    summarize(n_ip=sum(Child_IP_full_bin==TRUE|Child_IP_part_bin==TRUE)) %>%
+    ungroup() %>%
+    filter(n_ip<20) %>%
+    select(fips)
+  
+  # aggregate in person schooling and vaccination to county level
+  cnty_ip <- df %>%
+    group_by(fips, wk) %>%
+    summarize(n=n(),
+              n_vx=sum(had_vaccine=='Yes', na.rm = TRUE),
+              n_unvx=sum(had_vaccine=='No', na.rm = TRUE),
+              n_ip=sum(Child_IP_full_bin==TRUE|Child_IP_part_bin==TRUE)) %>%
+    ungroup() %>%
+    # calculate proportions, unless we are excluding that county
+    mutate(prop_vx=ifelse(fips %in% exclude$fips, NA, n_vx/(n_vx+n_unvx)),
+           prop_ip=ifelse(fips %in% exclude$fips, NA, n_ip/n)) %>%
+    select(-c(n_vx, n_unvx, n_ip, n)) %>%
+    filter(!is.na(fips))
+  
+  # create table of smoothed weekly estimates
+  cnty_ip_smooth <- data.frame(matrix(ncol = 4, nrow = 0))
+  names(cnty_ip_smooth) <- c('fips', 'wk', 'var', 'val')
+  
+  # list of all counties, and included counties
+  all_counties <- usmap::us_map(regions='counties')%>%select(fips)%>%unique()
+  included <- unique(cnty_ip%>%filter(!is.na(prop_ip))%>%select(fips))
+  
+  # for each county
+  for (i in all_counties$fips) {
+    # for proportion in per and proportion vaccinated
+    for (j in c('prop_ip', 'prop_vx')) {
+      
+      # check if we're including
+      if (i %in% included$fips) {
+        # subset to county
+        tmp <- cnty_ip %>% filter(fips == i)
+        
+        # check if we have at least 4 weeks of data
+        if (nrow(tmp) >= 4) {
+          
+          # extra double check that we don't have any NAs
+          if (!any(is.na(tmp[, j][[1]]))) {
+            
+            # fit smoothing spline
+            fit <- smooth.spline(x = tmp$wk, y = tmp[, j][[1]])
+            # predict for all 24 weeks
+            preds <- predict(fit, 1:24)
+            preds <- preds$y
+            # assign anythiing outside of [0,1] to the bounds
+            preds[which(preds>1)] <- 1
+            preds[which(preds<0)] <- 0
+            # add to data frame
+            cnty_ip_smooth <- rbind(cnty_ip_smooth,
+                                    data.frame(fips = i, wk = 1:24, 
+                                               var = j, val = preds))
+          } else {
+            # if we're missing values, set to NA
+            cnty_ip_smooth <- rbind(cnty_ip_smooth,
+                                    data.frame(fips = i, wk = 1:24, 
+                                               var = j, val = NA))
+          }
+        } else {
+          # if we have less than 3 weeks of data, set to NA
+          cnty_ip_smooth <- rbind(cnty_ip_smooth,
+                                  data.frame(fips = i, wk = 1:24,
+                                             var = j, val = NA))
+        }
+      } else {
+        # if we're excluding by criteria above, set to NA
+        cnty_ip_smooth <- rbind(cnty_ip_smooth,
+                                data.frame(fips = i, wk = 1:24, 
+                                           var = j, val = NA))
+      }
+    }
+  }
+  
+  # set week to last date of month
+  cnty_ip_smooth <- left_join(epiwk_dates, cnty_ip_smooth) %>%
+    mutate(Date = format(Date, format = c('%b-%d')))
+
+    
+    # data frame for in person plotting with gganimate --------------------------
+    plot_df <- cnty_ip_smooth %>%
+      filter(var=='prop_ip')%>%
+      select(c(fips, val, wk, Date)) %>%
+      mutate(val=val*100)
+    
+    # plot percent in person
+    ip_animated <- 
+      usmap::plot_usmap(regions='counties', 
+                        data= plot_df,
+                        values='val',
+                        color=NA) +
+      theme(legend.position = 'bottom') +
+      colorspace::scale_fill_continuous_diverging(palette='Tropic',mid=50,
+                                                  name='Percent\nin-person') +
+      geom_text(aes(y=500000, x=-2250000, label=as.character(Date)), 
+                check_overlap = TRUE, size=4.5) +
+      ggtitle('Weekly in-person schooling by county') +
+      theme(title=element_text(size=11)) +
+      transition_time(wk) +
+      enter_grow() +
+      exit_fade()
+
+   # data frame for vaccination plotting with gganimate ----------------------------------
+    plot_df <- cnty_ip_smooth %>%
+      filter(var=='prop_vx')%>%
+      select(c(fips, val, wk, Date)) %>%
+      mutate(val=val*100)
+    
+    # plot vaccination with any doses
+    vx_animated <- 
+      usmap::plot_usmap(regions='counties', 
+                        data= plot_df,
+                        values='val',
+                        color=NA) +
+      theme(legend.position = 'bottom') +
+      colorspace::scale_fill_continuous_diverging(palette='Tropic',mid=50,
+                                                  name='Percent vaccinated\n(any doses)') +
+      geom_text(aes(y=500000, x=-2250000, label=as.character(Date)), 
+                check_overlap = TRUE, size=4.5) +
+      ggtitle('Weekly vaccination with 1+ COVID-19 vaccine dose by county') +
+      theme(title=element_text(size=11)) +
+      transition_time(wk) +
+      enter_grow() +
+      exit_fade()
+      
+    
+    # plot alpha variant proportion over time ----------------------------
+    plot_df <- st_vt_smooth %>%
+      filter(var=='alpha')%>%
+      select(c(fips, val, wk, Date)) %>%
+      mutate(val=val*100)
+    
+    vt_animated_alpha <- usmap::plot_usmap(regions="states", 
+                      data= plot_df,
+                      values="val", 
+                      color=NA)+
+          theme(legend.position = "bottom")+
+          colorspace::scale_fill_continuous_diverging(palette = "Tropic",mid=50,
+                                                      name="Percent\nAlpha variant") +
+          geom_text(aes(y=500000, x=-2250000, label=as.character(Date)), 
+                    check_overlap = TRUE, size=4.5) +
+          ggtitle('Weekly Alpha prevalence by state') +
+          theme(title=element_text(size=11)) +
+          transition_time(wk) +
+          enter_grow() +
+          exit_fade()
+    
+    # plot delta variant proportion over time ----------------------------
+    plot_df <- st_vt_smooth %>%
+      filter(var=='delta')%>%
+      select(c(fips, val, wk, Date)) %>%
+      mutate(val=val*100)
+    
+    vt_animated_delta <- usmap::plot_usmap(regions="states", 
+                      data= plot_df,
+                      values="val", 
+                      color=NA)+
+          theme(legend.position = "bottom")+
+          colorspace::scale_fill_continuous_diverging(palette = "Tropic",mid=50,
+                                                      name="Percent\nDelta variant") +
+          geom_text(aes(y=500000, x=-2250000, label=as.character(Date)), 
+                    check_overlap = TRUE, size=4.5) +
+          ggtitle('Weekly Delta prevalence by state') +
+          theme(title=element_text(size=11)) +
+          transition_time(wk) +
+          enter_grow() +
+          exit_fade()
+    
+    # animate!
+    ip_gif <- animate(ip_animated,
+                      renderer=magick_renderer())
+    vx_gif <- animate(vx_animated,
+                      renderer=magick_renderer())
+    alpha_gif <- animate(vt_animated_alpha,
+                         renderer=magick_renderer())
+    delta_gif <- animate(vt_animated_delta,
+                         renderer=magick_renderer())
+    
+    # save individual gifs
+    anim_save('movies/ip.gif', ip_gif)
+    anim_save('movies/vx.gif', vx_gif)
+    anim_save('movies/alpha.gif', alpha_gif)
+    anim_save('movies/delta.gif', delta_gif)
+    
+    # # save multi-panel gif
+    # for(i in 1:90) {
+    #   new_gif <- cowplot::plot_grid(cowplot::ggdraw() + cowplot::draw_image(ip_gif[i]),
+    #                        cowplot::ggdraw() + cowplot::draw_image(vx_gif[i]),
+    #                        cowplot::ggdraw() + cowplot::draw_image(alpha_gif[i]),
+    #                        cowplot::ggdraw() + cowplot::draw_image(delta_gif[i]),
+    #                        ncol=2)
+    #   ggsave(
+    #       filename = file.path(paste0("movies/movieS1_", sprintf("%03d", i), ".png")),
+    #       plot = new_gif, width = 7, height = 6, device = "png")
+    # }
+    # 
+    # png_files <- sort(list.files(path = 'movies/', pattern = "movieS1_", full.names = TRUE))
+    # gifski(png_files, gif_file = "movieS1.gif", width = 672, height = 576, delay = 0.1,
+    #        progress = TRUE)
+}
+```
+
+<img src="movies/movieS1.gif" alt="Changes in in-person schooling, vaccination, and variant prevalence"/>
+
+## Figure S1
+
+Comparison of county-month vaccination rates between the survey and CDC data. (A) Proportion of survey respondents living with school-aged children that reported being vaccinated compared to all survey respondents. (B) Average monthly differences in proportion vaccinated between respondents living with school-aged children and all respondents by county. (C) Proportion of respondents living with school-aged children that reported being vaccinated compared to CDC-reported vaccination rates. (D) Average monthly differences in proportion vaccinated between survey respondents living with school-aged children and CDC reported vaccination rates by county. “Vaccinated” represents having received at least one COVID-19 vaccine dose. In (A,C) each point represents a county-month. Blue lines indicate fit smooth spline relationships, correlations are Pearson correlation coefficients, and slopes come from a simple linear regression. Limited to county-months with at least 5 survey respondents living with school-aged children (A-D) and at least 75% complete CDC data (C-D).
+
+```{r figureS1-text}
+# national-level estimates for respondents with school-age children
+us <- aggregate_national(df, 'any_vaccine', aggregate_by=NULL)
+
+# national-level estimates for respondents overall
+us_ws <- aggregate_national(df_ws, 'any_vaccine', aggregate_by=NULL)
+
+# national-week-level estimates for respondents overall
+df_us_ws <- aggregate_national(df_ws, 'any_vaccine')
+
+# compare in time periods
+ws1 <- df_us_ws%>%filter(wk==2)
+ws1 <- signif(ws1$mean*100,3)
+
+ws2 <- df_us_ws%>%filter(wk==23)
+ws2 <- signif(ws2$mean*100,3)
+
+sk1 <- df_us%>%filter(wk==2,variable=='any_vaccine')
+sk1 <- signif(sk1$mean*100,3)
+
+sk2 <- df_us%>%filter(wk==23,variable=='any_vaccine')
+sk2 <- signif(sk2$mean*100,3)
+
+message('In the whole dataset, percent that have received any vaccine increases from ',
+        ws1, ' to ', ws2, '. Among those with school-aged kids, percent with any vaccine',
+        ' increases from ', sk1, ' to ', sk2, '.')
+```
+
+```{r figureS1-prep-data}
+# aggregate county-level facebook vaccination data (for 1 & 2 doses)
+cnty_fbvax <- df %>%
+  filter(!is.na(had_vaccine)) %>%
+  group_by(month, fips) %>%
+  summarize(n=n(),
+            n_unvax=sum(had_vaccine=='No', na.rm = T),
+            n_somevax=sum(had_vaccine=='Yes', na.rm = T)) %>%
+  ungroup() %>%
+  mutate(fb_unvax=n_unvax/n,
+         fb_somevax=(n_somevax)/n)%>%
+  select(-c('n_unvax', 'n_somevax'))
+
+# county-level estimates for respondents overall
+cnty_fbvax_ws <- df_ws %>%
+  group_by(month, fips) %>%
+  summarize(n=n(),
+            n_unvax=sum(any_vaccine==FALSE, na.rm = T),
+            n_somevax=sum(any_vaccine==TRUE, na.rm = T)) %>%
+  ungroup() %>%
+  mutate(fb_unvax=n_unvax/n,
+         fb_somevax=(n_somevax)/n)%>%
+  select(-c('n_unvax', 'n_somevax'))
+
+# clean up cdc vaccination data
+cnty_cdcvax <- vx %>%
+  mutate(wk = lubridate::epiweek(Date),
+         month = lubridate::month(Date,label=TRUE),
+         n_unknown = Population*(1-Completeness_pct/100),
+         n_vax = Population*(Administered_Dose1_Pop_Pct/100)) %>%
+  mutate(n_unvax = Population-(n_unknown+n_vax)) %>%
+  group_by(month, FIPS) %>%
+  summarize(n=sum(Population),
+            n_unknown=sum(n_unknown),
+            n_vax=sum(n_vax),
+            n_unvax=sum(n_unvax)) %>%
+  ungroup() %>%
+  mutate(fips=FIPS,
+         cdc_unvax=n_unvax/n,
+         cdc_unknown=n_unknown/n,
+         cdc_somevax=n_vax/n) %>%
+  select(-c('FIPS', 'n', 'n_unvax', 'n_unknown', 'n_vax'))
+
+# join
+cnty_vax <- inner_join(cnty_fbvax, cnty_cdcvax)
+rm(cnty_fbvax, cnty_cdcvax)
+```
+
+```{r figureS1-exclusions}
+# remove facebook data where we have less than 5 responents with school-aged kids per county-month
+lowresp <- cnty_vax[which(cnty_vax$n < 5), c('fips', 'month')]
+total <- nrow(cnty_vax[, c('month', 'fips')])
+message('Excluding ', nrow(lowresp), '/', total, ' (', 
+        round(nrow(lowresp)/total*100, 1), '%) ',
+        'of county-months where facebook data has fewer than 5 respondents with school-aged kids per county-month.')
+cnty_vax <- cnty_vax %>%
+  filter(n >= 5)
+
+# flag CDC data where more than 25% of vaccination data is missing
+missvx <- cnty_vax[which(cnty_vax$cdc_unknown > 0.25), c('fips', 'month')]
+total <- nrow(cnty_vax[, c('month', 'fips')])
+message('Flagging an additional ', nrow(missvx), '/', total, ' (', round(nrow(missvx)/total*100, 1), '%) ',
+        'of county-months where CDC data is more than 25% incomplete.')
+cnty_vax <- cnty_vax %>%
+  mutate(include_cdc = ifelse(cdc_unknown <= 0.25, TRUE, FALSE))
+```
+
+```{r figS1, fig.width=8, fig.height=7, warning = FALSE}
+# prep data for plotting
+vax_plot <- cnty_vax %>%
+  # remove "unknown" from CDC vaccination rates
+  mutate(cdc_fullvax = cdc_somevax*(1/(cdc_unvax+cdc_somevax))) %>%
+  rename(k12_somevax = fb_somevax) %>%
+  # add in vaccination rates from full dataset
+  left_join(cnty_fbvax_ws%>%select(-fb_unvax, -n)) %>%
+  mutate(full_somevax = fb_somevax) %>%
+  # melt
+  reshape2::melt(id.vars = c('month', 'fips', 'k12_somevax', 'include_cdc'), 
+                 measure.vars = c('full_somevax',
+                                  'cdc_somevax')) %>%
+  # add informative variables for faceting
+  mutate(variable=recode(variable,
+                         full_somevax = 'All respondents',
+                         cdc_somevax = 'CDC data')) %>%
+  # exclude county-months where CDC data is more than 25% incomplete
+  filter(variable=='All respondents' | include_cdc==TRUE) %>%
+  select(-include_cdc)
+
+# get correlation and lm values
+vals <- vax_plot%>%group_by(variable)%>%
+      group_modify(~{
+         tmp <- broom::tidy(lm(k12_somevax~value, data=.x),conf.int=T)
+         tmp$cor <- cor(.x$value,.x$k12_somevax, use="complete.obs")
+         return(tmp)
+      })%>% filter(term=="value")
+
+# compare to CDC data
+vax_a <- compare_vax_plot(vax_plot, 'All respondents')
+
+# compare to all survey respondents
+vax_c <- compare_vax_plot(vax_plot, 'CDC data')
+
+# difference between CDC and facebook data
+vax_plot <- vax_plot %>%
+  mutate(prop_vx_diff = k12_somevax - value) %>%
+  group_by(fips, variable) %>%
+  mutate(avg_vx_diff = mean(prop_vx_diff, na.rm = T)) %>%
+  select(fips, variable, avg_vx_diff)
+
+# compare to CDC data
+vax_b <- compare_vax_map(vax_plot, 'All respondents')
+
+# compare to all survey respondents
+vax_d <- compare_vax_map(vax_plot, 'CDC data')
+
+# make plot
+vax_comp_plot <- cowplot::plot_grid(vax_a, vax_b, vax_c, vax_d, nrow=2, 
+                                    labels=c('A','B','C','D'),
+                                    rel_widths = c(0.75,1,0.75,1))
+
+vax_comp_plot
+```
+
+```{r}
+# remove anything we won't need anymore to save memory
+rm(list = ls()[grep('df_ws|plt|lowresp|missvx|vals|vax_plot|vax_a|vax_b|vax_c|vax_d|vx', ls())])
+```
+
+## Figure 3
+
+Risk associated with in-person schooling overall and by grade level. Odds ratios of COVID-19-related outcomes by full- and part-time in-person schooling compared to no in-person schooling, overall and stratified by grade, adjusted for individual- and county-level covariates across the study period from Jan. 12 to Jun. 12. Note: grade-stratified analyses include only those respondents who reported living with school-aged children in a single grade category, while the overall analyses include all respondents living with school-aged children; thus, the overall estimates do not always fall in-between the grade-specific estimates.
+
+```{r fig3-figS2-grades-analysis, cache=TRUE}
+
+# run time period analysis for figure 3
+gr_res <- lapply(list(c('jan_feb', 'mar_apr', 'may_jun'),
+                      'jan_feb', 'mar_apr', 'may_jun'), 
+                 run_grade_analysis,
+                 df = df)
+gr_res <- rbindlist(gr_res, use.names = TRUE) 
+
+# periods to plot
+plot_periods <- list(
+  c('Jan-Feb', 'Mar-Apr', 'May-Jun'),
+  c('Jan-Jun')
+)
+
+# loop over period to plot
+for (p in plot_periods) {
+  
+  # rename and factor period and grades for prettier plots
+  gr_plot <- gr_res %>%
+    filter(period %in% p) %>%
+    mutate(variable=recode(variable,
+                           Child_IP_full_bin = 'Full-time',
+                           Child_IP_part_bin = 'Part-time')) %>%
+    mutate(Grade=factor(Grade, levels = c("K or under", "1 to 5", 
+                                          "6 to 8", "9 to 12", "overall")))
+  
+  # make figure
+  gr_plot <- gr_plot %>%
+    filter(variable %in% c('Full-time', 'Part-time'),
+           adjusted == TRUE) %>%
+    ggplot(aes(x=Grade, y=estimate,
+               ymin=conf.low, ymax=conf.high,
+               color=outcome)) +
+        geom_pointrange(position=position_dodge(width=.5))+
+        geom_hline(yintercept=1)+
+        ylab("Odds ratio")+
+        scale_y_log10()+
+        scale_color_brewer(name="",type="qual", palette = "Dark2")+
+        theme_bw()+
+        theme(legend.position="bottom")
+  
+  # add faceting and save for multi-period plot
+  if (length(p)>1) {
+    gr_plot1 <- gr_plot +
+      facet_grid(cols=vars(variable), rows = vars(period))
+  
+  # add faceting and save for main overall plot
+  } else {
+    gr_plot2 <- gr_plot +
+      facet_grid(cols=vars(variable))
+    
+  }
+  
+}
+```
+
+```{r fig3, fig.height=3.5, fig.width=7}
+gr_plot2
+```
+
+## Figure S2
+
+Risk associated with in-person schooling overall and by grade level. Odds ratios of COVID-19-related outcomes by full- and part-time in-person schooling compared to no in-person schooling, overall and stratified by grade, adjusted for individual- and county-level covariates. Results are shown stratified by time periods Jan. 12 to Feb. 28 (Jan-Feb), Mar. 1 to Apr. 30 (Mar-Apr), and May 1 to Jun. 12 (May-Jun). Note: grade-stratified analyses include only those respondents who reported living with school-aged children in a single grade category, while the overall analyses include all respondents living with school-aged children; thus, the overall estimates do not always fall in-between the grade-specific estimates.
+
+```{r figS2, fig.height=7, fig.width=7}
+gr_plot1
+```
+
+## Table S3
+
+Relative odds of COVID-19-related outcomes by full- and part-time in-person schooling compared to no in-person schooling, either overall among respondents with school-aged children or stratified by grades among households with children in only a single grade.
+
+```{r tableS3}
+# prep to make table
+gr_tab <- gr_res %>%
+    mutate(variable=recode(variable,
+                           Child_IP_full_bin = 'Full-time',
+                           Child_IP_part_bin = 'Part-time'),
+           label=paste0(variable, ': ', Grade),
+           label=factor(label, 
+                        levels = c("Full-time: K or under", "Full-time: 1 to 5",
+                                   "Full-time: 6 to 8", "Full-time: 9 to 12", 
+                                   "Full-time: overall",
+                                   "Part-time: K or under", "Part-time: 1 to 5",
+                                   "Part-time: 6 to 8", "Part-time: 9 to 12", 
+                                   "Part-time: overall"))) %>%
+    filter(variable %in% c('Full-time', 'Part-time'),
+           adjusted == TRUE)
+
+setorderv(gr_tab, 'label')
+
+# make pretty table
+gr_disp_tbl <- reg_tbl_period_wrangle(gr_tab, 'Grade')
+
+# print result
+gr_disp_tbl
+
+# save
+gt::gtsave(gr_disp_tbl, paste0('tables/tableS3.html'))
+```
+
+## Figure 4
+
+Individual mitigation measures. (A) Percent of respondents with in-person schooling that reported each mitigation measure being used in January and June, weighted using US CTIS survey weights. (B) Odds ratio of COVID-19-related outcomes among respondents with children in in-person schooling who reported each mitigation measure compared to those with children in in-person schooling who did not report each measure, adjusted for individual- and county-level covariates across the study period from Jan. 12 to Jun. 12.
+
+```{r fig4, fig.height=6, fig.width=7, cache=TRUE}
+
+# run time period analysis for figure 4
+mt_res <- lapply(list(c('jan_feb', 'mar_apr', 'may_jun'),
+                        'jan_feb', 
+                        'mar_apr', 
+                        'may_jun'), 
+                 mit_type_analysis,
+                 df = df)
+mt_res <- rbindlist(mt_res, use.names = TRUE) 
+  
+# in person data frame aggregate to country-epiweek
+inperson_ag <- df%>% 
+      filter(Child_IP_any=="Yes")%>%
+      replace_na(
+        list(sch_maskMand_st=FALSE,
+          sch_maskMand_tch=FALSE,
+          sch_sameTch=FALSE,
+          sch_sameSt=FALSE,
+          sch_outdoorInstr=FALSE,
+          sch_restEntry=FALSE,
+          sch_redClassSize=FALSE,
+          sch_closedCafe=FALSE,
+          sch_closedPlay=FALSE,
+          sch_deskShields=FALSE,
+          sch_xdeskSpace=FALSE,
+          sch_noExtraCurr=FALSE,
+          sch_noShareSupp=FALSE,
+          sch_dailySymptScr=FALSE)
+        ) %>%
+      filter(n_interventions<=13)%>%
+      aggregate_national(variables = c('sch_maskMand_st',
+                                       'sch_maskMand_tch',
+                                       'sch_sameTch',
+                                       'sch_sameSt',
+                                       'sch_outdoorInstr',
+                                       'sch_restEntry',
+                                       'sch_redClassSize',
+                                       'sch_closedCafe',
+                                       'sch_closedPlay',
+                                       'sch_deskShields',
+                                       'sch_xdeskSpace',
+                                       'sch_noExtraCurr',
+                                       'sch_noShareSupp',
+                                       'sch_dailySymptScr',
+                                       'Child_IP_part_bin'),
+                         aggregate_by='month')%>%
+    select(month, variable, mean) %>%
+    filter(month %in% c('Jan', 'Jun'))
+    
+# plot over time
+p1 <- inperson_ag %>%
+        mutate(variable=factor(str_remove(variable,"sch_"),
+                               levels=c(sch_order, 'Child_IP_part_bin')))%>%
+        ggplot(aes(x = variable, y = mean*100, fill = month)) + 
+        geom_bar(stat = 'identity', position = position_dodge(), width=0.8) +
+        labs(y = 'Mitigation used (%)', x = NULL) +
+        theme_bw()+
+        scale_fill_manual(values = c('#A6611A', '#80CDC1'),
+                          name = NULL, labels = c('January', 'June'))+
+        scale_x_discrete(labels=c(sch_names, 
+                                  Child_IP_part_bin="part time"))+
+        theme(axis.text.x = element_blank(),
+              legend.position=c(0.92,0.85),
+              legend.background = element_blank())
+
+# plot risk estimates
+p2 <- mit_impact_plot(mt_res, time_period='Jan-Jun')
+
+# plot
+mit_plot <- cowplot::plot_grid(p1, p2, ncol = 1,
+                               labels = c('A','B'),
+                               rel_heights=c(0.58, 1))
+
+print(mit_plot)
+```
+
+## Figure S3
+
+Individual mitigation measures over time. Odds ratio of COVID-19-related outcomes among respondents living with children in in-person schooling who reported each mitigation measure compared to those living with children in in-person schooling who did not report each measure, adjusted for individual- and county-level covariates. Results are stratified by time periods Jan.12 to Feb. 28 (Jan-Feb), Mar. 1 to Apr. 30 (Mar-Apr), and May 1 to Jun. 12 (May-Jun).
+
+```{r figS3, fig.height=7,fig.width=7}
+# base plot of risk in different time period
+p3 <- mit_impact_plot(mt_res, time_period=c('Jan-Feb', 'Mar-Apr', 'May-Jun'))
+
+# add faceting
+p3 <- p3 +
+  facet_grid(rows = vars(period))
+
+p3
+```
+
+## Table S4
+
+Relative odds of COVID-19-related outcomes among respondents living with children in in-person schooling by individual mitigation measures within different time periods.
+
+```{r tableS4}
+# prep to make table
+mt_tab <- mt_res %>%
+    filter(str_detect(variable, "sch_")|variable=='Child_IP_part_bin')%>%
+    filter(str_detect(adjustment,"adjusted"))%>%
+    mutate(variable=factor(str_remove(variable,"sch_"),
+                           levels=c(sch_order, 'Child_IP_part_bin')),
+           label=recode(variable, !!!sch_names),
+           label=recode(label, Child_IP_part_bin = 'part time'),
+           adjusted=TRUE)
+
+# make pretty table
+mt_disp_tbl <- reg_tbl_period_wrangle(mt_tab, 'Mitigation measure')
+
+# print result
+mt_disp_tbl
+
+# save
+gt::gtsave(mt_disp_tbl, paste0('tables/tableS4.html'))
+```
+
+## Figure S4
+
+Individual mitigation measures and alternative COVID-19-related outcomes. Odds ratio of alternative COVID-19-related outcomes among respondents living with children in in-person schooling who reported each mitigation measure compared to those living with children in in-person schooling who did not report each measure, adjusted for individual- and county-level covariates across the Spring Semester 2021. Alternative COVID-19-related outcomes include COVID-like illness in any household member (blue), a household member testing positive for SARS-CoV-2 (green), and the survey respondent testing positive when the test was indicated (purple) and when it was not indicated (orange). High uncertainty around non-indicated positive tests reflects a small sample size (533 total non-indicated positive tests).
+
+```{r figS4, fig.height=4, fig.width=8, cache=TRUE}
+# run for alternative outcomes
+mt_res_alt <- mit_type_analysis(time_period = c('jan_feb', 'mar_apr', 'may_jun'),
+                                df = df,
+                                outcomes = c('cliHH_pos', 'cntct_HH_test_pos', 
+                                             'tst_pos_ind'),
+                                outcome_nms = c('COVID like illness in HH', 'HH member Test+', 
+                                                'Indicated Test+'))
+
+# base plot of risk by mitigation measures for alternative outcomes
+p4 <- mit_impact_plot(mt_res_alt, time_period=c('Jan-Jun'))
+
+# change the color
+p4 <- p4 + scale_color_manual(values = brewer.pal(7, name='Set1')[2:5], name = '')
+
+p4
+```
+
+## Figure 5
+
+Risk associated with in-person schooling over time by number of reported mitigation measures. Odds ratio of COVID-19-related outcomes by full- and part-time in-person schooling and number of school-based mitigation measures compared to no in-person schooling, adjusted for individual- and county-level covariates. “Overall” indicates adjusted odds ratios of full-time and part-time schooling with any number of mitigation measures compared to no in-person schooling. Odds ratios are shown across the entire study period from Jan. 12 to Jun. 12. (Jan-Jun), as well as within time periods from Jan.12 to Feb. 28 (Jan-Feb), Mar. 1 to Apr. 30 (Mar-Apr), and May 1 to Jun. 12 (May-Jun).
+
+```{r fig5, fig.height=8, fig.width=8, cache=TRUE}
+# run time period analysis for figure 5
+tp_res0 <- lapply(list(c('jan_feb', 'mar_apr', 'may_jun'),
+                      'jan_feb', 
+                      'mar_apr', 
+                      'may_jun'), 
+                 run_nmit_analysis,
+                 df = df)
+tp_res <- rbindlist(tp_res0, use.names = TRUE) 
+
+# rename and factor period and in-person schooling for prettier plots
+tp_res <- tp_res%>%
+  mutate(variable=recode(variable,
+                         ft_cat = 'Full-time',
+                         pt_cat = 'Part-time')) %>%
+  mutate(period=factor(period, levels = c('Jan-Jun', 'Jan-Feb',
+                                          'Mar-Apr', 'May-Jun')))
+
+# make figure
+nmit_plot <- tp_res %>%
+    ggplot(aes(x=label, y=estimate,
+               ymin=conf.low, ymax=conf.high,
+               color=outcome)) +
+        geom_pointrange(position=position_dodge(width=.5))+
+        facet_grid(cols=vars(variable), rows=vars(period))+
+        geom_hline(yintercept=1)+
+        xlab("Number of mitigation measures")+
+        ylab("Odds ratio")+
+        scale_y_log10()+
+        scale_color_brewer(name="",type="qual", palette = "Dark2")+
+        theme_bw()+
+        theme(legend.position="bottom")
+
+nmit_plot
+```
+
+## Table S5
+
+Relative odds of COVID-19-related outcomes by full- and part-time in-person schooling and either number of mitigation measures or overall compared to no in-person schooling within different time periods.
+
+```{r tableS5}
+# prep to make table
+tp_tab <- tp_res %>%
+    mutate(label=paste0(variable, ': ', label),
+           label=factor(label, 
+                        levels = c("Full-time: 0", "Full-time: 1-3",
+                                   "Full-time: 4-6", "Full-time: 7-9", 
+                                   "Full-time: 10+", "Full-time: Overall",
+                                   "Part-time: 0", "Part-time: 1-3",
+                                   "Part-time: 4-6", "Part-time: 7-9", 
+                                   "Part-time: 10+", "Part-time: Overall")),
+           adjusted = TRUE)
+
+setorderv(tp_tab, 'label')
+
+# make pretty table
+tp_disp_tbl <- reg_tbl_period_wrangle(tp_tab, 'Number of mitigation measures')
+
+# print result
+tp_disp_tbl
+
+# save
+gt::gtsave(tp_disp_tbl, paste0('tables/tableS5.html'))
+```
+
+## Figure S5
+
+Risk associated with in-person schooling by number of reported mitigation measures for alternative COVID-19-related outcomes. Odds ratio of alternative COVID-19-related outcomes by full- and part-time in-person schooling and number of school-based mitigation measures compared to no in-person schooling, adjusted for individual- and county-level covariates. “Overall” indicates adjusted odds ratios of full-time and part-time schooling with any number of mitigation measures compared to no in-person schooling across the Spring Semester 2021 (Jan 12. – Jun 12.). Alternative COVID-19-related outcomes include COVID-like illness in any household member (blue), a household member testing positive for SARS-CoV-2 (green), and the survey respondent testing positive when the test was indicated (purple) and when it was not indicated (orange). High uncertainty around non-indicated positive tests reflects a small sample size (533 total non-indicated positive tests).
+
+```{r figS5, fig.width=8, fig.height=4, cache=TRUE}
+# run time period analysis for figure S5 for alternative outcomes
+tp_res_alt <- lapply(list(c('jan_feb', 'mar_apr', 'may_jun')), 
+                     run_nmit_analysis,
+                     df = df,
+                     outcomes = c('cliHH_pos', 'cntct_HH_test_pos',
+                                  'tst_pos_ind'),
+                     outcome_nms = c('COVID like illness in HH', 'HH member Test+', 
+                                     'Indicated Test+'))
+tp_res_alt <- rbindlist(tp_res_alt, use.names = TRUE) 
+
+# rename and factor period and in-person schooling for prettier plots
+tp_res_alt <- tp_res_alt%>%
+  mutate(variable=recode(variable,
+                         ft_cat = 'Full-time',
+                         pt_cat = 'Part-time'))
+
+# make figure
+nmit_alt_plot <- tp_res_alt %>%
+      ggplot(aes(x=label, y=estimate,
+                 ymin=conf.low, ymax=conf.high,
+                 color=outcome)) +
+          geom_pointrange(position=position_dodge(width=.5))+
+          facet_grid(cols=vars(variable), scales = 'free')+
+          geom_hline(yintercept=1)+
+          xlab("Number of mitigation measures")+
+          ylab("Odds ratio")+
+          scale_y_log10()+
+          scale_color_manual(values = brewer.pal(7, name='Set1')[2:5], name = '')+
+          theme_bw()+
+          theme(legend.position="bottom")
+
+nmit_alt_plot
+```
+
+## Figure 6
+
+Risk associated with in-person schooling and Alpha/Delta variants over time. Estimated baseline risk (top panel) associated with the proportion of cases due to the Alpha and Delta variants and interaction with part-time (middle panel) and full-time (bottom panel) in-person schooling status. Interaction terms show the additional impact of the variant on top of baseline risk due to part- and full-time in-person schooling. Risk is shown within two-month time strata.
+
+```{r variant-analysis, echo = FALSE, cache = TRUE}
+
+df$variant_fit <- df$variant_fit*10
+
+outcomes <- c("tst2","cli","cli2")
+variant_out1 <- NULL
+for(outcome in outcomes) {
+    temp <- df %>%
+      pos_regs(outcome, as_df=TRUE, cnty_cov = T, variant = T, n_mit = F, include_unadj = F)
+    
+    variant_out1 <- bind_rows(variant_out1, temp)    
+}
+rm(temp)
+
+# build output object for plotting by variant strata
+variant_plt_dat1 <- variant_out1 %>%
+  filter(str_detect(variable, "variant_fit"), adjusted) %>%
+  mutate(type = ifelse(variable == "variant_fit", "Variant overall", "Variant interaction with IP schooling"))
+  
+```
+
+```{r fig6, echo = FALSE, fig.width=5, fig.height=7, cache = TRUE}
+
+## Designate three time periods
+df <- df%>%
+  mutate(period2=ifelse(Date<="2021-02-28","Jan to Feb", 
+                        ifelse(Date<="2021-04-30","Mar to Apr", "May to Jun")))
+
+# Run regressions
+outcomes <- c("tst2","cli","cli2")
+periods <- unique(df$period2)
+variant_out4 <- NULL
+for(outcome in outcomes) {
+  for(p in periods) {
+    temp <- df %>%
+      filter(period2 == p) %>%
+      pos_regs(outcome, as_df=TRUE, cnty_cov = T, variant = T, include_unadj = F) %>%
+      mutate(period = p)
+    
+    variant_out4 <- bind_rows(variant_out4, temp)    
+  }
+}
+rm(temp)
+
+var_names <- c(
+  "variant_fit" = "Variant (no interaction)",
+  "Child_IP_full_bin:variant_fit" = "Variant interaction with full-time",
+  "Child_IP_part_bin:variant_fit" = "Variant interaction with part-time"
+)
+
+# build output object for plotting by variant strata
+variant_plt_dat4 <- variant_out4 %>%
+  filter(str_detect(variable, "variant_fit"), adjusted) %>%
+  mutate(type = ifelse(variable == "variant_fit", "Variant overall", "Variant interaction with IP schooling"))
+  
+variant_plt_interaction4 <- ggplot(variant_plt_dat4,
+                                 aes(x= factor(period, levels = c("Jan to Feb","Mar to Apr", "May to Jun")),
+                                     y=estimate, ymin=conf.low, ymax=conf.high,
+                                     color=outcome,
+                                     shape = outcome))+
+  geom_pointrange(position=position_dodge(width=.5))+
+  facet_grid(rows = vars(factor(variable, levels = c("variant_fit",
+                                                     "Child_IP_part_bin:variant_fit",
+                                                     "Child_IP_full_bin:variant_fit"))),
+             scales = "free_y", labeller = as_labeller(var_names))+
+  scale_y_log10()+
+  #coord_cartesian(ylim=c(.2, 4))+
+      scale_color_brewer(type="qual", palette = "Dark2")+
+      theme_bw()+
+      theme(legend.position="bottom")+
+  geom_hline(yintercept = 1)+
+  labs(x="Time Period", y="OR", color = "", shape = "")
+    
+variant_plt_interaction4
+
+```
+
+## Table S6
+
+Relative odds of COVID-19-related outcomes corresponding to a 10% increase in variant prevalence (A) and interaction between variant prevalence and full- and part-time in-person schooling representing the increase in relative odds among comparted to those without children in part-time (B) and full-time (C) schooling, stratified by time period.
+
+```{r tableS6, echo = FALSE}
+
+# make data for table
+tbl_dat <- variant_plt_dat1 %>%
+  mutate(period = "Jan-Jun") %>%
+  bind_rows(variant_plt_dat4) %>%
+  mutate(period = ifelse(period == "Jan to Feb", "Jan-Feb",
+                         ifelse(period == "Mar to Apr", "Mar-Apr",
+                                ifelse(period == "May to Jun", "May-Jun", period)))) %>%
+  mutate(label=ifelse(label=="variant_fit", "Variant Prevalence (A)",
+                      ifelse(label == "Child_IP_full_binTRUE * variant_fit", "Full-time*Variant Ineraction (B)",
+                             ifelse(label == "Child_IP_part_binTRUE * variant_fit", "Part-time*Variant Ineraction (C)", label))))
+
+# Generate table with odds ratios by time period
+var_table <- reg_tbl_period_wrangle(tbl_dat, 'Variant term', expo = FALSE)
+var_table
+gt::gtsave(var_table, paste0('tables/tableS6.html'))
+```
+
+## Figure S6
+
+Risk associated with in-person schooling and Alpha/Delta variants over time adjusted for cumulative incidence. Estimated baseline risk (top panel) associated with the proportion of cases due to the Alpha and Delta variants and interaction with part-time (middle panel) and full-time (bottom panel) in-person schooling status. Interaction terms show the additional impact of the variant on top of baseline risk due to part- and full-time in-person schooling. Risk is shown within two-month time strata. Results are adjusted for all baseline covariates as well as cumulative incidence.
+
+```{r figS6, echo = FALSE, fig.width=5, fig.height=7, cache = TRUE}
+
+# Run regressions
+outcomes <- c("tst2","cli","cli2")
+periods <- unique(df$period2)
+variant_out6 <- NULL
+for(outcome in outcomes) {
+  for(p in periods) {
+    temp <- df %>%
+      filter(period2 == p) %>%
+      pos_regs(outcome, as_df=TRUE, cnty_cov = T, variant = T, n_mit = F, cum_inc = T, include_unadj = F) %>%
+      mutate(period = p)
+    
+    variant_out6 <- bind_rows(variant_out6, temp)    
+  }
+}
+rm(temp)
+
+var_names <- c(
+  "variant_fit" = "Variant (no interaction)",
+  "Child_IP_full_bin:variant_fit" = "Variant interaction with full-time",
+  "Child_IP_part_bin:variant_fit" = "Variant interaction with part-time"
+)
+
+# build output object for plotting by variant strata
+variant_plt_dat6 <- variant_out6 %>%
+  filter(str_detect(variable, "variant_fit"), adjusted) %>%
+  mutate(type = ifelse(variable == "variant_fit", "Variant overall", "Variant interaction with IP schooling"))
+  
+variant_plt_interaction6 <- ggplot(variant_plt_dat6,
+                                 aes(x=factor(period, levels = c("Jan to Feb","Mar to Apr", "May to Jun")),
+                                     y=estimate, ymin=conf.low, ymax=conf.high,
+                                     color=outcome,
+                                     shape = outcome))+
+  geom_pointrange(position=position_dodge(width=.5))+
+  facet_grid(rows = vars(factor(variable, levels = c("variant_fit",
+                                                     "Child_IP_part_bin:variant_fit",
+                                                     "Child_IP_full_bin:variant_fit"))),
+             scales = "free_y", labeller = as_labeller(var_names))+
+  scale_y_log10()+
+  #coord_cartesian(ylim=c(.2, 4))+
+      scale_color_brewer(type="qual", palette = "Dark2")+
+      theme_bw()+
+      theme(legend.position="bottom")+
+  geom_hline(yintercept = 1)+
+  labs(x="Time Period", y="OR", color = "", shape = "")
+
+variant_plt_interaction6
+```
+
+## Figure 7
+
+Correlations between vaccination, in-person schooling, and mitigation measures. Pearson’s correlation coefficients between percent vaccinated with at least one dose of a COVID-19 vaccine, percent of respondents living with school-aged children reporting in-person schooling, and average number of school-based mitigation measures by county-month. Results are shown within time periods Jan. 12 to Feb. 28 (left), Mar. 1 to Apr. 30 (center), and May 1 to Jun. 12 (right). All coefficients shown were significant (p < 0.05). Limited to county-months with at least 5 respondents.
+
+```{r fig7, fig.height=4, fig.width=8, warning = FALSE}
+# aggregate in-person schooling
+ag_ip <- df %>%
+    filter(Child_IP_type %in% c('FT', 'PT', 'None'),
+           !is.na(fips), 
+           (n_interventions<=13 | Child_IP_type == 'None')) %>%
+    group_by(period, month, fips) %>%
+    summarize(n=n(),
+              n_ip=sum(Child_IP_type != 'None'),
+              pct_ip=n_ip/n,
+              avg_int=mean(n_interventions, na.rm = TRUE)) %>%
+    ungroup()%>%
+    filter(n>=5) %>%
+    select(-c('n', 'n_ip')) %>%
+    reshape2::melt(id.vars=c('period', 'month', 'fips'))
+
+# aggregate vaccination
+ag_vx <- rbind(cnty_vax%>%
+                 select(month, fips, fb_somevax) %>%
+                 mutate(period=ifelse(month %in% c('Jan', 'Feb'),"jan_feb",
+                                      ifelse(month %in% c('Mar', 'Apr'), "mar_apr", "may_jun"))) %>%
+                 reshape2::melt(id.vars=c('period', 'month', 'fips')),
+                ag_ip)  %>%
+  mutate(variable = recode(variable, 
+                           avg_int = 'Mitigation measures',
+                           fb_somevax = 'Any doses (%)',
+                           pct_ip = 'In person (%)')) %>%
+  dcast(period + month + fips ~ variable, value.var = 'value')
+
+# run across study period
+p0 <- run_corr_analysis(ag_vx, c('jan_feb', 'mar_apr', 'may_jun'), 'January to June')
+
+# run for first time period, exclude legend
+p1 <- run_corr_analysis(ag_vx, 'jan_feb', 'January to February') +
+  theme(legend.position='none')
+
+# run for second period, exclude y and legend
+p2 <- run_corr_analysis(ag_vx, 'mar_apr', 'March to April') +
+  theme(axis.text.y=element_blank(), legend.position='none')
+
+# run for final period, exlude y
+p3 <- run_corr_analysis(ag_vx, 'may_jun', 'May to June') +
+  theme(axis.text.y=element_blank())
+
+corr_plot <- cowplot::plot_grid(p1, p2, p3, nrow=1, 
+                                rel_widths = c(1.006,0.554,0.812))
+
+corr_plot
+```
+
+```{r}
+# clear up some memory
+rm(ag_vx, ag_ip, vx, cnty_vax, p1, p2, p3, p4)
+```
+
+## Figure 8
+
+Risk associated with in-person schooling and number of vaccine doses. (A) Odds ratio of COVID-19-related outcomes by number of reported vaccine doses (0, 1 or 2) and in-person schooling status (living in a household with a child participating in any in-person (Any IP) or no in-person (No IP) schooling), adjusted for individual- and county-level covariates. Zero vaccine doses and any in-person schooling is the reference group. (B) Odds ratio of COVID-19-related outcomes with one and two vaccine doses compared to zero doses, when data are stratified by none, part-time, and full-time in-person schooling. (C) Odds ratio of COVID-19-related outcomes with part- and full-time in-person schooling compared to no in-person schooling when data are stratified by vaccine doses.
+
+```{r vax-plt-setup}
+# set up data frame for all vaccine sub-analyses
+df_vax <- df%>% 
+  # for those who have full and part time, set ip_cat to full time
+  mutate(ip_cat=ifelse(Child_IP_full_bin==TRUE, 'Full-time',
+                       ifelse(Child_IP_part_bin==TRUE, 'Part-time',
+                              'None')),
+         # set number of vaccine doses
+         vax_doses=ifelse(had_vaccine=='No', 0, 
+                          ifelse(vaccine_doses == 1, 1, 
+                                 ifelse(vaccine_doses == 2, 2, NA)))) %>%
+  # remove observations missing a vaccine response, or where response was "don't know"
+  filter(!is.na(vax_doses)) %>%
+  # create a variable with the interaction between in-person schooling and vaccine doses
+  mutate(vax_cat = ifelse(Child_IP_any=='Yes', 
+                          paste0('Any_', vax_doses, 'dose'),
+                          paste0('None_', vax_doses, 'dose')),
+         # set reference for interaction category to Any in-person & 0 vaccine doses
+         # because this is the category with highest risk
+         vax_cat = relevel(factor(vax_cat), ref = 'Any_0dose')) %>%
+  # set 0 doses to be reference for vaccine doses variable
+  mutate(vax_doses=relevel(factor(vax_doses),ref='0'))
+
+# base set of covariates
+base_covs <- c('rel_avg_biwk_AR', 
+               'IsMale', 
+               'Age', 
+               'OccupationRed',
+               'Educational_Level',
+               'HH_sz', 
+               'num_kid_recode', 
+               'Population', 
+               'White', 
+               'GINI', 
+               'Poverty', 
+               'Description',
+               'mask_level', 
+               'trav_out_state',
+               'bar_rest_cafe_activ',
+               'large_event_activ',
+               'pub_transit_activ')
+            
+# covariates for panel A
+covs_a <- c('vax_cat', base_covs)
+
+# covariates for panel B
+covs_b <- c('vax_doses', base_covs)
+
+# covariates for panel D
+covs_c <- c('Child_IP_full_bin', 'Child_IP_part_bin', base_covs)
+
+# outcomes
+outcomes <- c('tst_pos','cli_pos', 'cli2_pos')
+
+# just keep columns we absolutely need to save on memory
+df_vax <- df_vax %>%
+  select(c('State', 'weight', 'wk', 'month', 'ip_cat',
+           all_of(outcomes),
+           all_of(unique(c(covs_a, covs_b, covs_c)))))
+```
+
+```{r vax-plt-a, cache=TRUE}
+# run vaccine regression with interaction variable
+# for number of vaccine doses and any in-person schooling
+vax_res_a <- vax_reg(df_vax, covs=covs_a)
+
+# prep results to plot
+vax_res_a <- vax_res_a %>%
+      filter(variable=="vax_cat",
+             label!="vax_cat")%>%
+      mutate(group = gsub('Any_|None_|dose', '', label),
+             group = paste0(group, ' dose'),
+             ip = gsub('_0dose|_1dose|_2dose|ne', '', label),
+             ip_outcome=paste0(outcome, '_', ip),
+             ip = ifelse(outcome=='Loss taste/smell', paste0(ip, ' IP'), ''),
+             ip_outcome = factor(ip_outcome,
+                                 levels = c('Covid-like illness_Any', 'Loss taste/smell_Any',
+                                            'Overall Test+_Any', 'Covid-like illness_No',
+                                            'Loss taste/smell_No', 'Overall Test+_No')))
+
+# plot for a)
+vax_plt_a <- vax_res_a %>%
+      ggplot(aes(x=group, y=estimate, group = ip_outcome,
+                 ymin=conf.low, ymax=conf.high,
+                 color=outcome))+
+      geom_pointrange(position=position_dodge(width=0.7))+
+      geom_hline(yintercept=1)+
+      ylab("Odds ratio")+
+      scale_y_log10()+
+      scale_color_brewer(name="", type="qual", palette = "Dark2")+
+      theme_bw()+
+      theme(legend.position="bottom") +
+  geom_text(aes(label= ip, y=0.11), 
+            position = position_dodge(width = 0.7),
+            color = 'grey25', size = 3.5) +
+  theme(axis.title.x=element_blank(),
+        axis.text.x=element_text(color = 'grey25', size = 12.5),
+        legend.position='none')
+```
+
+```{r vax-plt-b, cache=TRUE}
+# set up results data frame
+vax_res_b <- NULL
+vax_res_tmp <- NULL
+
+# apply vaccine regression for different subsets of in person schooling
+for (i in c('Full-time', 'Part-time', 'None')) {
+  vax_res_tmp <- df_vax %>%
+    # subset to in person schooling category
+    filter(ip_cat==i) %>%
+    # run survey regression
+    vax_reg(covs=covs_b) %>%
+    # label category
+    mutate(ip_cat=i)
+  
+  # add to results data frame
+  vax_res_b <- rbind(vax_res_b, vax_res_tmp, use.names = TRUE)
+}
+rm(vax_res_tmp)
+
+# prep results to plot
+vax_res_b <- vax_res_b %>%
+      filter(variable=="vax_doses", 
+             label!="vax_doses",
+             reference_row==FALSE,
+             !is.na(ip_cat))%>%
+      mutate(ip_cat=factor(ip_cat, 
+                           levels = c('Full-time', 'Part-time', 'None')))
+
+# plot for b)
+vax_plt_b <- vax_res_b %>%
+      ggplot(aes(x=label, y=estimate, 
+                 ymin=conf.low, ymax=conf.high,
+                 color=outcome))+
+      geom_pointrange(position=position_dodge(width=.5))+
+      geom_hline(yintercept=1)+
+      facet_wrap(vars(ip_cat), nrow = 1)+
+      ylab("Odds ratio")+
+      xlab("Number of vaccine doses")+
+      scale_y_log10()+
+      scale_color_brewer(name="", type="qual", palette = "Dark2")+
+      theme_bw()+
+      theme(legend.position="none")
+```
+
+```{r vax-plt-c, cache=TRUE}
+# set up results data frame
+vax_res_c <- NULL
+vax_res_tmp <- NULL
+
+# apply vaccine regression for different subsets of vaccine doses
+for (i in 0:2) {
+  vax_res_tmp <- df_vax %>%
+    # subset to in person schooling category
+    filter(vax_doses==i) %>%
+    # run survey regression
+    vax_reg(covs=covs_c) %>%
+    # label category
+    mutate(vax_doses=i)
+  
+  # add to results data frame
+  vax_res_c <- rbind(vax_res_c, vax_res_tmp, use.names = TRUE)
+}
+rm(vax_res_tmp)
+
+# prep results to plot
+vax_res_c <- vax_res_c %>%
+      filter(variable %in% c('Child_IP_full_bin', 'Child_IP_part_bin'), 
+             !(label %in% c('Child_IP_full_bin', 'Child_IP_part_bin')))%>%
+      mutate(vax_doses=paste0(vax_doses, ' dose'),
+             vax_doses=factor(vax_doses, 
+                              levels = c('0 dose', '1 dose', '2 dose')),
+             label=ifelse(variable=='Child_IP_full_bin', 'Full-time', 'Part-time'),
+             label=factor(label, 
+                          levels = c('Full-time', 'Part-time')))
+
+# plot for c)
+vax_plt_c <- vax_res_c %>%
+      ggplot(aes(x=label, y=estimate, 
+                 ymin=conf.low, ymax=conf.high,
+                 color=outcome))+
+      geom_pointrange(position=position_dodge(width=.5))+
+      geom_hline(yintercept=1)+
+      facet_wrap(vars(vax_doses), nrow = 1)+
+      ylab("Odds ratio")+
+      xlab("In-person schooling")+
+      scale_y_log10()+
+      scale_color_brewer(name="", type="qual", palette = "Dark2")+
+      theme_bw()+
+      theme(legend.position="none")
+```
+
+```{r fig8, fig.width=6, fig.height=7}
+tmp <- cowplot::align_plots(vax_plt_a, vax_plt_b, vax_plt_c, align = 'h', axis = 'b')
+tmp <-cowplot::plot_grid(tmp[[1]],tmp[[2]],tmp[[3]], ncol=1,
+                         labels=c('A', 'B', 'C'),
+                         rel_heights=c(1,0.85,0.85))
+  
+legend_l<- cowplot::get_legend(vax_plt_a + theme(legend.position = 'bottom'))
+  
+vax_plot <- cowplot::plot_grid(tmp, legend_l, ncol=1, rel_heights = c(2,.1))
+
+vax_plot
+```
+
+## Table S7.
+
+Relative odds of COVID-19-related outcomes A) by number of reported vaccine doses and living in a household with a child participating in any or no in-person schooling compared to zero vaccine doses and any in-person schooling, B) with one and two vaccine doses compared to zero doses when data are stratified by none, part-time, and full-time in-person schooling, and C) by part- and full-time in-person schooling compared to no in-person schooling when data are stratified by vaccine doses.
+
+```{r tableS7-vax-doses}
+# combine vaccine regression results
+vx_reg_tbl <- rbindlist(list(vax_res_a %>%
+                               mutate(panel='vx_a',
+                                      label=recode(label,
+                                                   Any_0dose='0 dose & Any in-person',
+                                                   Any_1dose='1 dose & Any in-person',
+                                                   Any_2dose='2 dose & Any in-person',
+                                                   None_0dose='0 dose & No in-person',
+                                                   None_1dose='1 dose & No in-person',
+                                                   None_2dose='2 dose & No in-person')),
+                             vax_res_b %>%
+                               mutate(panel='vx_b',
+                                      label=paste0(ip_cat, ': ', label, ' dose')),
+                             vax_res_c %>%
+                               mutate(panel='vx_c',
+                                      label=paste0(vax_doses, ': ', label))),
+                        use.names = TRUE, fill = TRUE)
+
+setorderv(vx_reg_tbl, 'label')
+
+# prep to make table
+vx_reg_sum <- vx_reg_tbl %>%
+    mutate(adjusted="TRUE",
+           outcome=recode(outcome,
+                          `Covid-like illness`="COVID like illness",
+                          `Loss taste/smell`="Loss of taste/smell"))%>%
+    select(panel, outcome, adjusted, 
+           label, estimate, conf.low, conf.high)%>%
+    mutate(estimate=round(exp(estimate), 2),
+           conf.low=round(exp(conf.low), 2),
+           conf.high=round(exp(conf.high), 2))%>%
+    drop_na()%>%
+    pivot_wider(names_from=c(adjusted, outcome),
+                values_from=c(estimate,conf.low,conf.high)) %>%
+    mutate(panel = factor(panel))
+  
+  
+# printing regression table
+vx_reg_disp_tbl <- vx_reg_sum%>%
+    select(-panel)%>%
+    gt::gt()%>%
+    gt::tab_spanner(
+      label=c("Test+"),
+      columns = ends_with("Test+")
+    )%>% 
+    gt::tab_spanner(
+      label=c("COVID like illness"),
+      columns = ends_with("COVID like illness")
+    )%>%
+    gt::tab_spanner(
+      label=c("Loss of taste/smell"),
+      columns = ends_with("taste/smell")
+    )%>%
+    gt::cols_merge_range(
+      col_begin=vars(`conf.low_TRUE_Loss of taste/smell`),
+      col_end=vars(`conf.high_TRUE_Loss of taste/smell`)
+    )%>%
+    gt::cols_merge_range(
+      col_begin=vars(`conf.low_TRUE_Overall Test+`),
+      col_end=vars(`conf.high_TRUE_Overall Test+`)
+    )%>%
+    gt::cols_merge_range(
+      col_begin=vars(`conf.low_TRUE_COVID like illness`),
+      col_end=vars(`conf.high_TRUE_COVID like illness`)
+    )%>%
+    gt::cols_label(
+      `conf.low_TRUE_Loss of taste/smell`="95% CI",
+      `conf.low_TRUE_Overall Test+`="95% CI",
+      `conf.low_TRUE_COVID like illness`="95% CI",
+      `estimate_TRUE_Loss of taste/smell`="adj. OR",
+      `estimate_TRUE_Overall Test+`="adj OR",
+      `estimate_TRUE_COVID like illness`="adj OR",
+      label='Category'
+    )%>%
+    gt::tab_options(
+      row_group.font.weight   = "lighter",
+      column_labels.font.weight = "bold"
+    )%>%
+    gt::tab_row_group(label = 'A) OR by vaccine doses and in-person schooling',
+                      rows = which(vx_reg_sum$panel=='vx_a'))%>%
+    gt::tab_row_group(label = 'B) OR by vaccine doses, stratified by in-person schooling',
+                      rows = which(vx_reg_sum$panel=='vx_b'))%>%
+    gt::tab_row_group(label = 'C) OR by in-person schooling, stratified by vaccine doses',
+                      rows = which(vx_reg_sum$panel=='vx_c'))%>%
+    gt::row_group_order(c('A) OR by vaccine doses and in-person schooling',
+                          'B) OR by vaccine doses, stratified by in-person schooling',
+                          'C) OR by in-person schooling, stratified by vaccine doses'))%>%
+    gt::cols_align("left")
+
+# print result
+vx_reg_disp_tbl
+
+# save
+gt::gtsave(vx_reg_disp_tbl, paste0('tables/tableS7.html'))
+```
