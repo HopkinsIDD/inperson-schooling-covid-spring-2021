@@ -6,4 +6,4 @@ Code is provided to reproduce the primary in-person schooling (`1-Main-Schooling
 
 Data to reproduce paper figures/tables are freely available from the CMU Delphi Research Group to researchers at universities and non-profits as detailed at Getting Data Access - Delphi Epidata API (cmu-delphi.github.io).
 
-Please reach out to justin[at]jhu.edu if you have any questions.
+Please reach out to jlessler[at]unc.edu if you have any questions.
